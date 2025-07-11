@@ -79,6 +79,13 @@ bool filament_present = true;
 bool last_filament_present = true;
 bool motor_on = true;
 
+float speed_mm_s = SPEED_MM_S;
+uint32_t current_vactual = 0;
+
+bool move_active = false;
+Motor_State move_direction = Stop;
+uint32_t move_end_time = 0;
+
 uint32_t timeout = DEFAULT_TIMEOUT; // timeout in ms
 bool is_timeout = false; // error flag, set if pushing filament for 30s without stopping
 bool continuous_run = false; // flag for continuous movement
@@ -121,6 +128,15 @@ void sendMovement(MoveReport r) {
   }
 }
 
+uint32_t mmpsToVactual(float mm_s) {
+  const float rpm = mm_s * SPEED_MULTIPLIER;
+  return static_cast<uint32_t>(rpm * MOVE_DIVIDE_NUM * 200.0f / 60.0f / 0.715f);
+}
+
+inline float absFloat(float v) {
+  return v < 0.0f ? -v : v;
+}
+
 } // namespace
 
 void buffer_init() {
@@ -129,6 +145,7 @@ void buffer_init() {
 
   buffer_sensor_init();
   buffer_motor_init();
+  current_vactual = mmpsToVactual(speed_mm_s);
   delay(ONE_SECOND_MS);
 
   timer.pause();
@@ -149,6 +166,7 @@ void updateStatus();
 
   sendMessage(String("timeout ") + timeout);
   sendMessage(String("multi_press_count ") + multi_press_count);
+  sendMessage(String("speed ") + String(speed_mm_s, 2));
   last_filament_present = digitalRead(ENDSTOP_3) == 0;
   sendMessage(last_filament_present ? "p1" : "p0");
 
@@ -257,7 +275,7 @@ void runMotor(Motor_State dir, Motor_State last_state) {
     driver.VACTUAL(STOP);
   }
   driver.shaft(dir == Forward ? FORWARD : BACK);
-  driver.VACTUAL(VACTUAL_VALUE);
+  driver.VACTUAL(current_vactual);
   motor_on = true;
 }
 
@@ -271,6 +289,32 @@ void disableMotor() {
   WRITE_EN_PIN(1);
   driver.VACTUAL(STOP);
   motor_on = false;
+}
+
+bool handleMove(Motor_State &last_motor_state) {
+  if (!move_active) {
+    return false;
+  }
+  if (digitalRead(ENDSTOP_3) != 0) {
+    disableMotor();
+    motor_state = Stop;
+    sendMovement(MoveReport::O);
+    move_active = false;
+    return true;
+  }
+  if (millis() >= move_end_time) {
+    holdMotor();
+    motor_state = Stop;
+    sendMovement(MoveReport::S);
+    move_active = false;
+    return true;
+  }
+  runMotor(move_direction, last_motor_state);
+  is_front = move_direction == Forward;
+  last_motor_state = move_direction;
+  motor_state = move_direction;
+  sendMovement(move_direction == Forward ? MoveReport::F : MoveReport::B);
+  return true;
 }
 
 bool handleContinuousRun(Motor_State &last_motor_state) {
@@ -352,6 +396,10 @@ void motor_control() {
   static uint32_t last_key2_time = 0;
   static uint8_t key2_count = 0;
 
+  if (handleMove(last_motor_state)) {
+    return;
+  }
+
   if (handleContinuousRun(last_motor_state)) {
     return;
   }
@@ -378,6 +426,8 @@ void motor_control() {
     is_front = false;
     front_time = 0;
     is_timeout = false;
+    continuous_run = false;
+    move_active = false;
     disableMotor();
 
     return; // no filament, exit
@@ -477,26 +527,31 @@ void reportAllStatus() {
   sendMessage(filament_present ? "p1" : "p0");
   sendMessage(String("timeout ") + timeout);
   sendMessage(String("multi_press_count ") + multi_press_count);
+  sendMessage(String("speed ") + String(speed_mm_s, 2));
 }
 
 void handleCommand(const String &cmd) {
   if (cmd == "f") {
+    move_active = false;
     continuous_run = true;
     continuous_direction = Forward;
     runMotor(Forward, motor_state);
     motor_state = Forward;
     sendMovement(MoveReport::FPLUS);
   } else if (cmd == "b") {
+    move_active = false;
     continuous_run = true;
     continuous_direction = Back;
     runMotor(Back, motor_state);
     motor_state = Back;
     sendMovement(MoveReport::BPLUS);
   } else if (cmd == "s") {
+    move_active = false;
     is_timeout = true;
     continuous_run = false;
     sendMovement(MoveReport::T);
   } else if (cmd == "n") {
+    move_active = false;
     continuous_run = false;
     is_timeout = false;
     if (digitalRead(ENDSTOP_3) == 0) {
@@ -509,6 +564,7 @@ void handleCommand(const String &cmd) {
       sendMovement(MoveReport::O);
     }
   } else if (cmd == "o") {
+    move_active = false;
     continuous_run = false;
     is_timeout = false;
     disableMotor();
@@ -516,6 +572,28 @@ void handleCommand(const String &cmd) {
     sendMovement(MoveReport::O);
   } else if (cmd == "q") {
     reportAllStatus();
+  } else if (cmd.startsWith("set_speed")) {
+    String v = cmd.substring(String("set_speed").length());
+    v.trim();
+    const float num = v.toFloat();
+    if (num > 0.0f) {
+      speed_mm_s = num;
+      current_vactual = mmpsToVactual(speed_mm_s);
+    }
+    sendMessage(String("speed ") + String(speed_mm_s, 2));
+  } else if (cmd.startsWith("move")) {
+    String v = cmd.substring(String("move").length());
+    v.trim();
+    const float dist = v.toFloat();
+    move_active = true;
+    continuous_run = false;
+    is_timeout = false;
+    move_direction = dist >= 0 ? Forward : Back;
+    const float duration = absFloat(dist) / (speed_mm_s > 0.0F ? speed_mm_s : 1.0F) * 1000.0F;
+    move_end_time = millis() + static_cast<uint32_t>(duration);
+    runMotor(move_direction, motor_state);
+    motor_state = move_direction;
+    sendMovement(move_direction == Forward ? MoveReport::F : MoveReport::B);
   } else if (cmd.startsWith("set_timeout")) {
     String v = cmd.substring(String("set_timeout").length());
     v.trim();
@@ -571,6 +649,8 @@ void updateStatus() {
     last_filament_present = filament_present;
     if (!filament_present) {
       disableMotor();
+      continuous_run = false;
+      move_active = false;
       sendMovement(MoveReport::O);
     }
   }

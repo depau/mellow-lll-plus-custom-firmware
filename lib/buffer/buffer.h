@@ -55,7 +55,6 @@ inline constexpr double SPEED_MM_S = 30.0;
 inline constexpr double SPEED_MULTIPLIER = 9.1463414634;
 inline constexpr double SPEED_RPM = SPEED_MM_S * SPEED_MULTIPLIER; // speed in r/min
 inline constexpr int32_t MOVE_DIVIDE_NUM = 16;
-inline constexpr uint32_t VACTUAL_VALUE = static_cast<uint32_t>(SPEED_RPM * MOVE_DIVIDE_NUM * 200.0f / 60.0f / 0.715f);
 
 #define STOP 0 // stop
 #define I_CURRENT (600) // motor current
